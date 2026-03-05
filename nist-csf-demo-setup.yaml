@@ -1,0 +1,689 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  NIST CSF 2.0 Dashboard Demo Environment - creates a realistic mix of PASS and FAIL
+  controls across all 6 NIST CSF 2.0 functions for portfolio demonstration purposes.
+  Stack is 100% removable via nist-csf-demo-teardown.yaml.
+  Target region: us-east-1
+
+# ============================================================
+# EXPECTED DASHBOARD RESULTS (after deploy + ManualStep1):
+#   GOVERN   : 2 PASS (password policy, no root access keys)  | 2 FAIL (root MFA, no org)
+#   IDENTIFY : 4 PASS (Config, Access Analyzer, CloudTrail x2)
+#   PROTECT  : 3 PASS (KMS, S3 versioning, S3 public block)   | 1 FAIL (inline policy)
+#   DETECT   : 4 PASS (GuardDuty, SecurityHub, CloudTrail, CW alarm)
+#   RESPOND  : 1 PASS (SNS)                                   | 2 FAIL (no EventBridge, no Lambda)
+#   RECOVER  : 3 PASS (Backup plan, CFN stack, S3 versioning)
+#   OVERALL  : ~72%
+# ============================================================
+
+Parameters:
+  Environment:
+    Type: String
+    Default: demo
+    AllowedValues:
+      - demo
+      - test
+    Description: Deployment environment label applied to all resource tags
+
+  ProjectTag:
+    Type: String
+    Default: nist-csf-dashboard
+    Description: Project tag applied to all resources for cost tracking and identification
+
+Resources:
+
+  # ===========================================================
+  # GOVERN (GV)
+  # GV-01 PASS : IAM Password Policy (via Lambda Custom Resource)
+  # GV-01 PASS : demo-service-account has no inline policies
+  # GV-02 FAIL : Root MFA intentionally not enabled
+  # GV-03 FAIL : AWS Organizations intentionally not created
+  # ===========================================================
+
+  PasswordPolicyLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub nist-demo-password-policy-role-${AWS::AccountId}
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: IAMPasswordPolicyAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - iam:UpdateAccountPasswordPolicy
+                  - iam:DeleteAccountPasswordPolicy
+                  - iam:GetAccountPasswordPolicy
+                Resource: '*'
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectTag
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: CloudFormation
+        - Key: Purpose
+          Value: NIST-CSF-Demo
+
+  PasswordPolicyLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub nist-demo-password-policy-fn-${AWS::AccountId}
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt PasswordPolicyLambdaRole.Arn
+      Timeout: 30
+      Code:
+        ZipFile: |
+          import boto3
+          import cfnresponse
+
+          def handler(event, context):
+              iam = boto3.client('iam')
+              request_type = event.get('RequestType')
+              try:
+                  if request_type in ('Create', 'Update'):
+                      iam.update_account_password_policy(
+                          MinimumPasswordLength=14,
+                          RequireUppercaseCharacters=True,
+                          RequireLowercaseCharacters=True,
+                          RequireNumbers=True,
+                          RequireSymbols=True,
+                          MaxPasswordAge=90,
+                          PasswordReusePrevention=12,
+                          AllowUsersToChangePassword=True
+                      )
+                      print("Password policy set successfully.")
+                  elif request_type == 'Delete':
+                      try:
+                          iam.delete_account_password_policy()
+                          print("Password policy deleted.")
+                      except Exception:
+                          print("No password policy to delete - skipping.")
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+              except Exception as e:
+                  print(f"Error: {e}")
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {'Error': str(e)})
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectTag
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: CloudFormation
+        - Key: Purpose
+          Value: NIST-CSF-Demo
+
+  AccountPasswordPolicy:
+    Type: AWS::CloudFormation::CustomResource
+    Properties:
+      ServiceToken: !GetAtt PasswordPolicyLambda.Arn
+    DependsOn: PasswordPolicyLambda
+
+  # GV-01 PASS: IAM user with managed policy only - no inline policies
+  DemoServiceAccount:
+    Type: AWS::IAM::User
+    Properties:
+      UserName: demo-service-account
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/ReadOnlyAccess
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectTag
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: CloudFormation
+        - Key: Purpose
+          Value: NIST-CSF-Demo
+
+  # PR-01 FAIL + GV FAIL (intentional): IAM user with inline policy
+  # Simulates a legacy misconfiguration - inline policies are an IAM anti-pattern
+  DemoLegacyUser:
+    Type: AWS::IAM::User
+    Properties:
+      UserName: demo-legacy-user
+      Policies:
+        - PolicyName: legacy-inline-policy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                Resource: '*'
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectTag
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: CloudFormation
+        - Key: Purpose
+          Value: NIST-CSF-Demo
+
+  # ===========================================================
+  # IDENTIFY (ID) - all 4 checks green
+  # ID-01 PASS : AWS Config recorder enabled
+  # ID-02 PASS : IAM Access Analyzer active
+  # ID-03 PASS : CloudTrail multi-region trail logging
+  # ID-04 PASS : AWS Config delivery channel configured
+  # ===========================================================
+
+  ConfigBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Delete
+    Properties:
+      BucketName: !Sub nist-demo-config-bucket-${AWS::AccountId}
+      VersioningConfiguration:
+        Status: Enabled
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        IgnorePublicAcls: true
+        BlockPublicPolicy: true
+        RestrictPublicBuckets: true
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectTag
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: CloudFormation
+        - Key: Purpose
+          Value: NIST-CSF-Demo
+
+  ConfigBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref ConfigBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AWSConfigBucketPermissionsCheck
+            Effect: Allow
+            Principal:
+              Service: config.amazonaws.com
+            Action: s3:GetBucketAcl
+            Resource: !Sub arn:aws:s3:::nist-demo-config-bucket-${AWS::AccountId}
+            Condition:
+              StringEquals:
+                AWS:SourceAccount: !Ref AWS::AccountId
+          - Sid: AWSConfigBucketDelivery
+            Effect: Allow
+            Principal:
+              Service: config.amazonaws.com
+            Action: s3:PutObject
+            Resource: !Sub arn:aws:s3:::nist-demo-config-bucket-${AWS::AccountId}/AWSLogs/${AWS::AccountId}/Config/*
+            Condition:
+              StringEquals:
+                s3:x-amz-acl: bucket-owner-full-control
+                AWS:SourceAccount: !Ref AWS::AccountId
+
+  ConfigServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub nist-demo-config-role-${AWS::AccountId}
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: config.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWS_ConfigRole
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectTag
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: CloudFormation
+        - Key: Purpose
+          Value: NIST-CSF-Demo
+
+  ConfigRecorder:
+    Type: AWS::Config::ConfigurationRecorder
+    Properties:
+      Name: nist-demo-recorder
+      RoleARN: !GetAtt ConfigServiceRole.Arn
+      RecordingGroup:
+        AllSupported: true
+        IncludeGlobalResourceTypes: true
+    DependsOn: ConfigBucketPolicy
+
+  ConfigDeliveryChannel:
+    Type: AWS::Config::DeliveryChannel
+    Properties:
+      Name: nist-demo-delivery-channel
+      S3BucketName: !Ref ConfigBucket
+    DependsOn: ConfigRecorder
+
+  # ID-02 PASS: IAM Access Analyzer
+  AccessAnalyzer:
+    Type: AWS::AccessAnalyzer::Analyzer
+    Properties:
+      AnalyzerName: nist-demo-analyzer
+      Type: ACCOUNT
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectTag
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: CloudFormation
+        - Key: Purpose
+          Value: NIST-CSF-Demo
+
+  # ID-03 PASS: CloudTrail S3 bucket
+  TrailBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Delete
+    Properties:
+      BucketName: !Sub nist-demo-trail-bucket-${AWS::AccountId}
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        IgnorePublicAcls: true
+        BlockPublicPolicy: true
+        RestrictPublicBuckets: true
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectTag
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: CloudFormation
+        - Key: Purpose
+          Value: NIST-CSF-Demo
+
+  TrailBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref TrailBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AWSCloudTrailAclCheck
+            Effect: Allow
+            Principal:
+              Service: cloudtrail.amazonaws.com
+            Action: s3:GetBucketAcl
+            Resource: !Sub arn:aws:s3:::nist-demo-trail-bucket-${AWS::AccountId}
+            Condition:
+              StringEquals:
+                AWS:SourceArn: !Sub arn:aws:cloudtrail:us-east-1:${AWS::AccountId}:trail/nist-demo-trail
+          - Sid: AWSCloudTrailWrite
+            Effect: Allow
+            Principal:
+              Service: cloudtrail.amazonaws.com
+            Action: s3:PutObject
+            Resource: !Sub arn:aws:s3:::nist-demo-trail-bucket-${AWS::AccountId}/AWSLogs/${AWS::AccountId}/*
+            Condition:
+              StringEquals:
+                s3:x-amz-acl: bucket-owner-full-control
+                AWS:SourceArn: !Sub arn:aws:cloudtrail:us-east-1:${AWS::AccountId}:trail/nist-demo-trail
+
+  # CloudWatch Log Group for CloudTrail metric filter
+  TrailLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /nist-demo/cloudtrail
+      RetentionInDays: 90
+
+  TrailLogGroupRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub nist-demo-trail-cw-role-${AWS::AccountId}
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: cloudtrail.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: CloudTrailToCloudWatchLogs
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !GetAtt TrailLogGroup.Arn
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectTag
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: CloudFormation
+        - Key: Purpose
+          Value: NIST-CSF-Demo
+
+  # ID-03 PASS + DE-03 PASS: Multi-region CloudTrail with CloudWatch Logs
+  DemoTrail:
+    Type: AWS::CloudTrail::Trail
+    Properties:
+      TrailName: nist-demo-trail
+      S3BucketName: !Ref TrailBucket
+      IsLogging: true
+      IsMultiRegionTrail: true
+      EnableLogFileValidation: true
+      IncludeGlobalServiceEvents: true
+      CloudWatchLogsLogGroupArn: !GetAtt TrailLogGroup.Arn
+      CloudWatchLogsRoleArn: !GetAtt TrailLogGroupRole.Arn
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectTag
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: CloudFormation
+        - Key: Purpose
+          Value: NIST-CSF-Demo
+    DependsOn: TrailBucketPolicy
+
+  # ===========================================================
+  # PROTECT (PR)
+  # PR-01 FAIL : demo-legacy-user has inline policy (created above)
+  # PR-02 PASS : Customer Managed KMS Key present and enabled
+  # PR-03 PASS : S3 account-level block public access (see ManualStep1 output)
+  # PR-04 PASS : S3 bucket with versioning enabled
+  # ===========================================================
+
+  DemoCMK:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: NIST CSF Demo CMK - satisfies PR-02 (KMS CMK present and enabled)
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: EnableRootAccess
+            Effect: Allow
+            Principal:
+              AWS: !Sub arn:aws:iam::${AWS::AccountId}:root
+            Action: kms:*
+            Resource: '*'
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectTag
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: CloudFormation
+        - Key: Purpose
+          Value: NIST-CSF-Demo
+
+  DemoCMKAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: alias/nist-demo-cmk
+      TargetKeyId: !Ref DemoCMK
+
+  # PR-04 PASS + RC-03 PASS: versioned S3 bucket
+  VersionedBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Delete
+    Properties:
+      BucketName: !Sub nist-demo-versioned-bucket-${AWS::AccountId}
+      VersioningConfiguration:
+        Status: Enabled
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        IgnorePublicAcls: true
+        BlockPublicPolicy: true
+        RestrictPublicBuckets: true
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectTag
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: CloudFormation
+        - Key: Purpose
+          Value: NIST-CSF-Demo
+
+  # ===========================================================
+  # DETECT (DE) - all 4 checks green
+  # DE-01 PASS : GuardDuty detector enabled
+  # DE-02 PASS : Security Hub enabled
+  # DE-03 PASS : CloudTrail logging active (DemoTrail above)
+  # DE-04 PASS : CloudWatch alarm exists
+  # ===========================================================
+
+  # NOTE: GuardDuty is FREE for 30 days on accounts that have never enabled it.
+  GuardDutyDetector:
+    Type: AWS::GuardDuty::Detector
+    Properties:
+      Enable: true
+      FindingPublishingFrequency: SIX_HOURS
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectTag
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: CloudFormation
+        - Key: Purpose
+          Value: NIST-CSF-Demo
+
+  SecurityHub:
+    Type: AWS::SecurityHub::Hub
+    Properties:
+      EnableDefaultStandards: true
+      Tags:
+        Project: !Ref ProjectTag
+        Environment: !Ref Environment
+        ManagedBy: CloudFormation
+        Purpose: NIST-CSF-Demo
+
+  # RS-02 PASS + alarm action target
+  DemoSNSTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: nist-demo-alerts
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectTag
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: CloudFormation
+        - Key: Purpose
+          Value: NIST-CSF-Demo
+
+  # DE-04 PASS: Metric filter on CloudTrail logs - CIS Benchmark 3.3
+  RootUsageMetricFilter:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: !Ref TrailLogGroup
+      FilterName: RootAccountUsageFilter
+      FilterPattern: '{ $.userIdentity.type = "Root" && $.userIdentity.invokedBy NOT EXISTS && $.eventType != "AwsServiceEvent" }'
+      MetricTransformations:
+        - MetricName: RootAccountUsage
+          MetricNamespace: NISTCSFDemo/Security
+          MetricValue: '1'
+          DefaultValue: 0
+    DependsOn: DemoTrail
+
+  # DE-04 PASS: CloudWatch Alarm fires on root account activity
+  RootLoginAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: nist-demo-root-login-alarm
+      AlarmDescription: Triggers when root account is used - NIST CSF DE-04
+      Namespace: NISTCSFDemo/Security
+      MetricName: RootAccountUsage
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      AlarmActions:
+        - !Ref DemoSNSTopic
+      TreatMissingData: notBreaching
+    DependsOn: RootUsageMetricFilter
+
+  # ===========================================================
+  # RESPOND (RS)
+  # RS-01 FAIL : No EventBridge rules (intentional gap)
+  # RS-02 PASS : DemoSNSTopic above satisfies this check
+  # RS-03 FAIL : No Lambda functions (intentional gap)
+  # ===========================================================
+
+  # ===========================================================
+  # RECOVER (RC)
+  # RC-01 PASS : AWS Backup vault and plan created
+  # RC-02 PASS : This CloudFormation stack is the IaC recovery artifact
+  # RC-03 PASS : VersionedBucket above has versioning enabled
+  # ===========================================================
+
+  # Explicit vault - Default vault may not exist on fresh accounts
+  DemoBackupVault:
+    Type: AWS::Backup::BackupVault
+    Properties:
+      BackupVaultName: NistDemoVault
+      BackupVaultTags:
+        Project: !Ref ProjectTag
+        Environment: !Ref Environment
+        ManagedBy: CloudFormation
+        Purpose: NIST-CSF-Demo
+
+  DemoBackupPlan:
+    Type: AWS::Backup::BackupPlan
+    Properties:
+      BackupPlan:
+        BackupPlanName: nist-demo-backup-plan
+        BackupPlanRule:
+          - RuleName: daily-backup
+            TargetBackupVault: !Ref DemoBackupVault
+            ScheduleExpression: cron(0 12 * * ? *)
+            StartWindowMinutes: 60
+            CompletionWindowMinutes: 120
+            Lifecycle:
+              DeleteAfterDays: 30
+      BackupPlanTags:
+        Project: !Ref ProjectTag
+        Environment: !Ref Environment
+        ManagedBy: CloudFormation
+        Purpose: NIST-CSF-Demo
+    DependsOn: DemoBackupVault
+
+# ============================================================
+# OUTPUTS
+# ============================================================
+Outputs:
+
+  StackName:
+    Description: Name of this CloudFormation stack
+    Value: !Ref AWS::StackName
+
+  AccountId:
+    Description: AWS Account ID
+    Value: !Ref AWS::AccountId
+
+  Region:
+    Description: Deployed AWS region
+    Value: !Ref AWS::Region
+
+  ConfigBucketName:
+    Description: S3 bucket used by AWS Config (ID-01 / ID-04)
+    Value: !Ref ConfigBucket
+
+  TrailBucketName:
+    Description: S3 bucket used by CloudTrail (ID-03)
+    Value: !Ref TrailBucket
+
+  VersionedBucketName:
+    Description: S3 bucket with versioning enabled (PR-04 and RC-03)
+    Value: !Ref VersionedBucket
+
+  KMSKeyId:
+    Description: Customer Managed KMS Key ID (PR-02)
+    Value: !Ref DemoCMK
+
+  KMSKeyArn:
+    Description: Customer Managed KMS Key ARN
+    Value: !GetAtt DemoCMK.Arn
+
+  GuardDutyDetectorId:
+    Description: GuardDuty Detector ID (DE-01)
+    Value: !Ref GuardDutyDetector
+
+  SNSTopicArn:
+    Description: SNS Topic ARN for alerts (RS-02)
+    Value: !Ref DemoSNSTopic
+
+  BackupPlanId:
+    Description: AWS Backup Plan ID (RC-01)
+    Value: !Ref DemoBackupPlan
+
+  BackupVaultName:
+    Description: AWS Backup Vault name (RC-01)
+    Value: !Ref DemoBackupVault
+
+  AccessAnalyzerArn:
+    Description: IAM Access Analyzer ARN (ID-02)
+    Value: !GetAtt AccessAnalyzer.Arn
+
+  CloudTrailArn:
+    Description: CloudTrail Trail ARN (ID-03 and DE-03)
+    Value: !GetAtt DemoTrail.Arn
+
+  CloudWatchLogGroup:
+    Description: CloudWatch Log Group for CloudTrail events (DE-04)
+    Value: !Ref TrailLogGroup
+
+  ManualStep1:
+    Description: >
+      REQUIRED - Run this CLI command after stack deploy to satisfy PR-03.
+      S3 account-level block public access cannot be set via CloudFormation.
+    Value: !Sub >
+      aws s3control put-public-access-block
+      --account-id ${AWS::AccountId}
+      --public-access-block-configuration
+      BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true
+      --region us-east-1
+
+  GovernNote:
+    Description: GOVERN gaps explanation
+    Value: >
+      GV-02 FAIL - Root MFA intentionally not enabled (most common real-world gap).
+      GV-03 FAIL - AWS Organizations intentionally not created (standalone account).
+
+  RespondNote:
+    Description: RESPOND gaps explanation
+    Value: >
+      RS-01 FAIL - No EventBridge rules (intentional).
+      RS-03 FAIL - No Lambda functions (intentional).
+      Most common pattern in early-stage AWS setups.
+
+  RecoverNote:
+    Description: RECOVER explanation
+    Value: >
+      RC-01 PASS - Backup plan and vault created (first backup runs at 12:00 UTC daily).
+      RC-02 PASS - This CloudFormation stack is the IaC recovery artifact.
+      RC-03 PASS - Versioned S3 bucket satisfies data recovery baseline.
+
+  ExpectedDashboardScore:
+    Description: Approximate compliance scores when scanned by nist-csf-dashboard
+    Value: >
+      GOVERN 50% | IDENTIFY 100% | PROTECT 75% | DETECT 100% | RESPOND 33% | RECOVER 100%
+      OVERALL approximately 72%
+
+  TeardownInstructions:
+    Description: How to cleanly remove all resources after demo
+    Value: >
+      Run: bash teardown.sh --profile YOUR_PROFILE --region us-east-1
+      Or manually delete stack: aws cloudformation delete-stack --stack-name nist-csf-demo-setup --region us-east-1
