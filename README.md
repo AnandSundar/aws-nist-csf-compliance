@@ -10,6 +10,9 @@
 
 ---
 
+<img width="1024" height="1536" alt="image" src="https://github.com/user-attachments/assets/98de280e-f499-4e1c-931d-372ad28fa41c" />
+
+
 ## What Is This?
 
 Companies running software in the cloud (AWS) need to prove they follow security best practices. Auditors, clients, and regulators increasingly ask for proof of compliance with NIST CSF — a framework published by the US National Institute of Standards and Technology. Most teams have no easy way to check their compliance status quickly.
@@ -143,6 +146,11 @@ OVERALL   [██████████████░░░░░░░] 72.7
 - ✅ = 90–100% (Compliant)
 - ⚠️ = 50–89% (Needs Attention)
 - ❌ = 0–49% (Critical Gap)
+
+**CSV Report:**
+
+<img width="1832" height="617" alt="image" src="https://github.com/user-attachments/assets/d37504f4-eec3-4cf9-bbed-22255a50c84e" />
+
 
 ---
 
